@@ -25,6 +25,11 @@ $MinNodeMajor      = 22
 $ConfigDir         = Join-Path $env:USERPROFILE ".jetbrains"
 $ConfigFile        = Join-Path $ConfigDir "acp.json"
 
+# Set-Content's "utf8" means UTF-8 *with* a BOM on Windows PowerShell 5.1, which
+# some JSON readers choke on. PowerShell 7+ (Core) supports "utf8NoBOM", so use
+# that whenever it is available and fall back to the BOM-ed encoding on 5.1.
+$JsonEncoding      = if ($PSVersionTable.PSVersion.Major -ge 6) { "utf8NoBOM" } else { "utf8" }
+
 function Info($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Ok($msg)   { Write-Host "OK  $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "!!  $msg" -ForegroundColor Yellow }
@@ -207,7 +212,7 @@ if ($envBlock.Count -gt 0) { $agentEntry["env"] = $envBlock }
 
 $config["agent_servers"][$AgentDisplayName] = $agentEntry
 
-($config | ConvertTo-Json -Depth 10) | Set-Content -Path $ConfigFile -Encoding utf8
+($config | ConvertTo-Json -Depth 10) | Set-Content -Path $ConfigFile -Encoding $JsonEncoding
 
 Ok "Registered '$AgentDisplayName' in $ConfigFile"
 
