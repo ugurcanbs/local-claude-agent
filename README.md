@@ -12,7 +12,7 @@ Two equivalent installers are provided:
 ## What the scripts do
 
 1. **Node.js** — check for Node.js >= 22; install it if missing or too old (via Homebrew/apt/nvm on macOS/Linux, or winget/choco on Windows).
-2. **Install the ACP agent** — install/update `@agentclientprotocol/claude-agent-acp` globally via npm, and resolve the path to its executable/entry point.
+2. **Install the ACP agent** — install the pinned version of `@agentclientprotocol/claude-agent-acp` globally via npm, apply the local patches for it (see [Local patches](#local-patches)), and resolve the path to its executable/entry point.
 3. **Claude Code CLI (auth)** — check for the local `claude` CLI, offering to install it if missing. Authentication is done by logging in to this CLI (`claude`), reusing your existing Claude subscription/plan rather than requiring JetBrains AI credits or a paid API key. As a fallback, if no CLI login is found but `ANTHROPIC_API_KEY` is set in the environment, the script asks before embedding it in plaintext in the config file — this is not the default or recommended path.
 4. **Register the agent** — write/merge an entry into the JetBrains ACP config (`~/.jetbrains/acp.json` on macOS/Linux, `%USERPROFILE%\.jetbrains\acp.json` on Windows), pointing it at the installed agent binary. Existing config is backed up first (`acp.json.bak.<timestamp>`) and merged rather than overwritten, so other configured agents are preserved.
 5. **Detect installed JetBrains IDEs** — best-effort, informational scan of common install locations (Toolbox, `/Applications`, `Program Files`, etc.) to confirm a compatible IDE is present. This step never fails the script.
@@ -28,6 +28,24 @@ Two equivalent installers are provided:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install-claude-acp-jetbrains.ps1
 ```
+
+## Local patches
+
+Fixes for upstream bugs that are not released yet live in `patches/claude-agent-acp/<version>/`, one unified diff per fix, made against that exact published version. The installers install the pinned version (`PINNED_VERSION` in the `.sh`, `$PinnedVersion` in the `.ps1`) and apply its patches; re-running them is safe, as an already-applied patch is skipped.
+
+To install another version, set `CLAUDE_AGENT_ACP_VERSION` (e.g. `CLAUDE_AGENT_ACP_VERSION=latest ./install-claude-acp-jetbrains.sh`). If that version has no folder of its own, the pinned version's patches are tried: applying them is reported as a warning (unexpected success, check the fix is still needed), failing to apply them stops the installer, since the bug may still be there. Once upstream ships a fix, create the new version's folder with a README and no `.patch` file.
+
+The macOS/Linux installer applies patches with `patch` (no fuzz, offsets allowed); the Windows one uses `git apply` and so needs git. The Windows path is untested.
+
+After patching, the installers check that `dist/acp-agent.js` still parses and run each `*.check.mjs` in the version's folder against the installed package; a check proves its patch's fix actually behaves, since a hunk can apply in the wrong place and still report success. A failing check stops the installer.
+
+`CLAUDE_AGENT_ACP_VERSION` is handed to npm as the version spec, so it can also name a tag, a directory or a git URL: only point it at code you trust, as the install may run under `sudo`.
+
+`npm update -g` or a manual reinstall replaces the patched files: re-run the installer afterwards.
+
+| Patch | Fixes | Upstream |
+| --- | --- | --- |
+| `0.86.0/0001-settle-advisor-tool-results.patch` (check: `advisor-settles.check.mjs`) | turns that call the advisor tool fail with "Claude ended the turn without returning results for tool calls: srvtoolu_…", and JetBrains then kills the agent. Fixed when the advisor's result arrives; a call that never gets one (a message sent while it runs, or a client tool call earlier in the same response) still fails (analysis in `docs/upstream-pr-abandoned-server-tool.md`) | [PR #1247](https://github.com/agentclientprotocol/claude-agent-acp/pull/1247), draft comment in `docs/upstream-pr-1247-comment.md` |
 
 ## After installing
 

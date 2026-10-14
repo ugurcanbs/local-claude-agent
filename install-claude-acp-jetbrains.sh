@@ -9,14 +9,21 @@
 #
 # What it does:
 #   1. Checks/installs Node.js >= 22 (required by the package).
-#   2. Installs/updates @agentclientprotocol/claude-agent-acp globally via npm.
+#   2. Installs the pinned version of @agentclientprotocol/claude-agent-acp
+#      globally via npm (override with CLAUDE_AGENT_ACP_VERSION=<version>), then
+#      applies the local fixes stored in patches/claude-agent-acp/<version>/.
 #   3. Checks for the Claude Code CLI (used for auth) and offers to install it.
 #   4. Registers the agent in ~/.jetbrains/acp.json, merging with any
 #      existing agents already configured there.
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE="@agentclientprotocol/claude-agent-acp"
+# The version the patches in patches/claude-agent-acp/ were made and tested against.
+PINNED_VERSION="0.86.0"
+AGENT_VERSION="${CLAUDE_AGENT_ACP_VERSION:-${PINNED_VERSION}}"
+PATCH_ROOT="${SCRIPT_DIR}/patches/claude-agent-acp"
 BIN_NAME="claude-agent-acp"
 AGENT_DISPLAY_NAME="Claude Agent (ACP)"
 MIN_NODE_MAJOR=22
@@ -79,13 +86,78 @@ ok "npm $(npm -v) OK"
 # 2. Install the ACP agent package
 # ---------------------------------------------------------------------------
 
-info "Installing/updating ${PACKAGE} globally via npm..."
-if ! npm install -g "${PACKAGE}"; then
+info "Installing ${PACKAGE}@${AGENT_VERSION} globally via npm..."
+if ! npm install -g "${PACKAGE}@${AGENT_VERSION}"; then
   warn "Global npm install failed (this is often a permissions issue with a system Node.js install)."
   warn "Retrying with sudo..."
-  sudo npm install -g "${PACKAGE}" || fail "Failed to install ${PACKAGE}. Consider using nvm to manage Node.js so global installs don't need sudo."
+  sudo npm install -g "${PACKAGE}@${AGENT_VERSION}" || fail "Failed to install ${PACKAGE}@${AGENT_VERSION}. Consider using nvm to manage Node.js so global installs don't need sudo."
 fi
-ok "${PACKAGE} installed"
+ok "${PACKAGE}@${AGENT_VERSION} installed"
+
+# ---------------------------------------------------------------------------
+# 2b. Apply local patches to the installed package
+# ---------------------------------------------------------------------------
+# Patches live in patches/claude-agent-acp/<version>/ and are made against that
+# exact published version. A version with no folder of its own gets the pinned
+# version's patches: applying them is an unexpected success (warning, check the
+# result), failing to apply them is an error, since the bugs they fix may still
+# be there.
+
+apply_patches() {
+  local pkg_dir="$1" installed_version="$2" patch_dir source_version patches run=() opts=(-p1 -F0 -s -f)
+  if [[ -d "${PATCH_ROOT}/${installed_version}" ]]; then
+    source_version="${installed_version}"
+  else
+    source_version="${PINNED_VERSION}"
+    warn "No patches recorded for ${installed_version}; trying those made for ${source_version}."
+  fi
+  patch_dir="${PATCH_ROOT}/${source_version}"
+  # A missing folder is not "nothing to patch": only an existing folder without
+  # a .patch file records that a version needs no fix.
+  [[ -d "${patch_dir}" ]] || fail "Patch folder ${patch_dir} is missing; run this script from a full checkout of the repository."
+  shopt -s nullglob
+  patches=("${patch_dir}"/*.patch)
+  shopt -u nullglob
+  if [[ "${#patches[@]}" -eq 0 ]]; then
+    ok "No patches to apply for ${installed_version}"
+    return
+  fi
+  command -v patch >/dev/null 2>&1 || fail "The 'patch' command is required to apply ${patch_dir}/*.patch."
+  [[ -w "${pkg_dir}/dist" ]] || run=(sudo)
+  # GNU patch leaves a .orig backup when a hunk applies at an offset; BSD patch
+  # only backs up when asked to.
+  if patch --version 2>/dev/null | grep -q 'GNU patch'; then
+    opts+=(--no-backup-if-mismatch)
+  fi
+  local p name
+  for p in "${patches[@]}"; do
+    name="$(basename "$p")"
+    if patch "${opts[@]}" -d "${pkg_dir}" -R --dry-run <"$p" >/dev/null 2>&1; then
+      if [[ "${source_version}" == "${installed_version}" ]]; then
+        ok "Patch ${name} already applied"
+      else
+        warn "Patch ${name}, made for ${source_version}, is already present in ${installed_version}: check whether upstream shipped the fix."
+      fi
+    elif patch "${opts[@]}" -d "${pkg_dir}" --dry-run <"$p" >/dev/null 2>&1; then
+      ${run[@]+"${run[@]}"} patch "${opts[@]}" -d "${pkg_dir}" <"$p" || fail "Patch ${name} passed its dry run but failed to apply to ${pkg_dir}."
+      if [[ "${source_version}" == "${installed_version}" ]]; then
+        ok "Applied patch ${name}"
+      else
+        warn "Applied patch ${name}, made for ${source_version}, to ${installed_version}: unexpected success, check the fix is still needed and correct."
+      fi
+    else
+      fail "Patch ${name} (made for ${source_version}) does not apply to ${PACKAGE} ${installed_version} in ${pkg_dir}. Its fix may be missing: update the patch, or, if upstream fixed it, create ${PATCH_ROOT}/${installed_version}/ holding a README and no .patch file."
+    fi
+  done
+  # A hunk can apply in the wrong place and still report success: prove the
+  # result loads and that each fix behaves, before the IDE launches it.
+  node --check "${pkg_dir}/dist/acp-agent.js" || fail "The patched ${pkg_dir}/dist/acp-agent.js no longer parses."
+  local check
+  for check in "${patch_dir}"/*.check.mjs; do
+    [[ -f "${check}" ]] || continue
+    node "${check}" "${pkg_dir}" || fail "Check $(basename "${check}") failed against ${pkg_dir}: the patched agent does not behave as the patch intends."
+  done
+}
 
 AGENT_PATH="$(command -v "${BIN_NAME}" 2>/dev/null || true)"
 if [[ -z "${AGENT_PATH}" ]]; then
@@ -96,6 +168,16 @@ if [[ -z "${AGENT_PATH}" ]]; then
 fi
 [[ -n "${AGENT_PATH}" ]] || fail "Could not locate the installed '${BIN_NAME}' executable after installation."
 ok "Resolved agent executable: ${AGENT_PATH}"
+
+# Patch the package the IDE will launch: the executable links to
+# <package>/dist/index.js. `npm root -g` can name another copy when the install
+# fell back to sudo and root's npm prefix differs from this user's.
+PKG_DIR="$(node -p 'require("path").resolve(require("fs").realpathSync(process.argv[1]), "../..")' "${AGENT_PATH}")"
+[[ -f "${PKG_DIR}/package.json" ]] || fail "Could not find the package behind ${AGENT_PATH} (expected ${PKG_DIR}/package.json)."
+[[ "$(node -p 'require(process.argv[1]).name' "${PKG_DIR}/package.json")" == "${PACKAGE}" ]] || fail "${AGENT_PATH} does not belong to ${PACKAGE} (resolved to ${PKG_DIR})."
+INSTALLED_VERSION="$(node -p 'require(process.argv[1]).version' "${PKG_DIR}/package.json")"
+info "Applying local patches to ${PACKAGE} ${INSTALLED_VERSION} in ${PKG_DIR}..."
+apply_patches "${PKG_DIR}" "${INSTALLED_VERSION}"
 
 # ---------------------------------------------------------------------------
 # 3. Claude Code CLI (auth)

@@ -7,7 +7,10 @@
 
 .DESCRIPTION
   1. Checks/installs Node.js >= 22 (required by the package) via winget or choco.
-  2. Installs/updates @agentclientprotocol/claude-agent-acp globally via npm.
+  2. Installs the pinned version of @agentclientprotocol/claude-agent-acp
+     globally via npm (override with $env:CLAUDE_AGENT_ACP_VERSION), then
+     applies the local fixes stored in patches\claude-agent-acp\<version>\
+     (requires git, used as the patch tool).
   3. Checks for the Claude Code CLI (used for auth) and offers to install it.
   4. Registers the agent in %USERPROFILE%\.jetbrains\acp.json, merging with
      any existing agents already configured there.
@@ -20,6 +23,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $Package           = "@agentclientprotocol/claude-agent-acp"
+# The version the patches in patches\claude-agent-acp\ were made and tested against.
+$PinnedVersion     = "0.86.0"
+$AgentVersion      = if ($env:CLAUDE_AGENT_ACP_VERSION) { $env:CLAUDE_AGENT_ACP_VERSION } else { $PinnedVersion }
+$PatchRoot         = Join-Path $PSScriptRoot "patches\claude-agent-acp"
 $AgentDisplayName  = "Claude Agent (ACP)"
 $MinNodeMajor      = 22
 $ConfigDir         = Join-Path $env:USERPROFILE ".jetbrains"
@@ -89,12 +96,96 @@ Ok "npm $((& npm -v))"
 # 2. Install the ACP agent package
 # ---------------------------------------------------------------------------
 
-Info "Installing/updating $Package globally via npm..."
-& npm install -g $Package
-if ($LASTEXITCODE -ne 0) { Fail "Failed to install $Package." }
-Ok "$Package installed"
+Info "Installing $Package@$AgentVersion globally via npm..."
+& npm install -g "$Package@$AgentVersion"
+if ($LASTEXITCODE -ne 0) { Fail "Failed to install $Package@$AgentVersion." }
+Ok "$Package@$AgentVersion installed"
 
 $npmRoot = (& npm root -g).Trim()
+
+# ---------------------------------------------------------------------------
+# 2b. Apply local patches to the installed package
+# ---------------------------------------------------------------------------
+# Patches live in patches\claude-agent-acp\<version>\ and are made against that
+# exact published version. A version with no folder of its own gets the pinned
+# version's patches: applying them is an unexpected success (warning, check the
+# result), failing to apply them is an error, since the bugs they fix may still
+# be there. Windows has no 'patch' command, so git applies them; it behaves as
+# a plain patch tool outside a repository.
+
+function Invoke-GitApply($PkgDir, $PatchFile, [switch]$Reverse, [switch]$Check) {
+  $gitArgs = @("-C", $PkgDir, "apply")
+  if ($Reverse) { $gitArgs += "--reverse" }
+  if ($Check) { $gitArgs += "--check" }
+  $gitArgs += $PatchFile
+  # Under "Stop", Windows PowerShell 5.1 turns a native command's stderr into a
+  # terminating error, and a failing --check is an expected answer here.
+  $ErrorActionPreference = "Continue"
+  & git @gitArgs 2>$null | Out-Null
+  return ($LASTEXITCODE -eq 0)
+}
+
+function Apply-Patches($PkgDir, $InstalledVersion) {
+  if (Test-Path (Join-Path $PatchRoot $InstalledVersion)) {
+    $sourceVersion = $InstalledVersion
+  } else {
+    $sourceVersion = $PinnedVersion
+    Warn "No patches recorded for $InstalledVersion; trying those made for $sourceVersion."
+  }
+  $patchDir = Join-Path $PatchRoot $sourceVersion
+  # A missing folder is not "nothing to patch": only an existing folder without
+  # a .patch file records that a version needs no fix.
+  if (-not (Test-Path $patchDir)) {
+    Fail "Patch folder $patchDir is missing; run this script from a full checkout of the repository."
+  }
+  $patches =@(Get-ChildItem -Path $patchDir -Filter *.patch -File -ErrorAction SilentlyContinue | Sort-Object Name)
+  if ($patches.Count -eq 0) {
+    Ok "No patches to apply for $InstalledVersion"
+    return
+  }
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Fail "git is required to apply $patchDir\*.patch."
+  }
+  foreach ($p in $patches) {
+    if (Invoke-GitApply $PkgDir $p.FullName -Reverse -Check) {
+      if ($sourceVersion -eq $InstalledVersion) {
+        Ok "Patch $($p.Name) already applied"
+      } else {
+        Warn "Patch $($p.Name), made for $sourceVersion, is already present in ${InstalledVersion}: check whether upstream shipped the fix."
+      }
+    } elseif (Invoke-GitApply $PkgDir $p.FullName -Check) {
+      if (-not (Invoke-GitApply $PkgDir $p.FullName)) {
+        Fail "Patch $($p.Name) passed its check but failed to apply to $PkgDir."
+      }
+      if ($sourceVersion -eq $InstalledVersion) {
+        Ok "Applied patch $($p.Name)"
+      } else {
+        Warn "Applied patch $($p.Name), made for $sourceVersion, to ${InstalledVersion}: unexpected success, check the fix is still needed and correct."
+      }
+    } else {
+      Fail "Patch $($p.Name) (made for $sourceVersion) does not apply to $Package $InstalledVersion in $PkgDir. Its fix may be missing: update the patch, or, if upstream fixed it, create $PatchRoot\$InstalledVersion\ holding a README and no .patch file."
+    }
+  }
+  # A hunk can apply in the wrong place and still report success: prove the
+  # result loads and that each fix behaves, before the IDE launches it.
+  $ErrorActionPreference = "Continue"
+  & node --check (Join-Path $PkgDir "dist\acp-agent.js")
+  if ($LASTEXITCODE -ne 0) { Fail "The patched $PkgDir\dist\acp-agent.js no longer parses." }
+  foreach ($check in @(Get-ChildItem -Path $patchDir -Filter *.check.mjs -File | Sort-Object Name)) {
+    & node $check.FullName $PkgDir
+    if ($LASTEXITCODE -ne 0) {
+      Fail "Check $($check.Name) failed against ${PkgDir}: the patched agent does not behave as the patch intends."
+    }
+  }
+}
+
+$pkgDir = Join-Path $npmRoot ($Package -replace '/', '\')
+$pkgJson = Join-Path $pkgDir "package.json"
+if (-not (Test-Path $pkgJson)) { Fail "Could not find the installed package at $pkgDir." }
+$installedVersion = (Get-Content $pkgJson -Raw | ConvertFrom-Json).version
+Info "Applying local patches to $Package $installedVersion..."
+Apply-Patches $pkgDir $installedVersion
+
 $distPath = Join-Path $npmRoot "@agentclientprotocol\claude-agent-acp\dist\index.js"
 if (-not (Test-Path $distPath)) {
   Fail "Could not locate the installed package entry point at $distPath."
