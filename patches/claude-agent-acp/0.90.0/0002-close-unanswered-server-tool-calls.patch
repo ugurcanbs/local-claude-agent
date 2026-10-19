@@ -1,0 +1,34 @@
+Close a server tool call left without a result instead of failing the turn.
+
+recordDispatchedToolUses records server_tool_use blocks as dispatched to the
+tool runner, but the API runs server tools (the advisor, web search) inside the
+response. One with no result when the turn ends was abandoned by Claude: a
+client tool_use came earlier in the same response, or a steering message
+arrived while it ran. As dispatched, it fails the prompt with
+incomplete_tool_call ("Claude ended the turn without returning results for
+tool calls: srvtoolu_..."), and JetBrains kills the agent. Not recorded, it
+takes the existing abandoned path: the tool call is closed and the turn ends.
+
+Not submitted upstream; see docs/upstream-pr-abandoned-server-tool.md.
+
+--- a/dist/acp-agent.js
++++ b/dist/acp-agent.js
+@@ -9224,14 +9224,14 @@
+             calls.delete(oldest);
+     }
+ }
+-/** Records the tool_use blocks of a complete assistant message. */
++/** Records the tool_use blocks of a complete assistant message. A server_tool_use (the
++ *  advisor, web search) is not recorded: the API runs it inside the response, so one that
++ *  has no result when the turn ends was abandoned by Claude, not lost by the tool runner. */
+ function recordDispatchedToolUses(session, content) {
+     if (!Array.isArray(content))
+         return;
+     for (const block of content) {
+-        if ((block?.type === "tool_use" ||
+-            block?.type === "server_tool_use" ||
+-            block?.type === "mcp_tool_use") &&
++        if ((block?.type === "tool_use" || block?.type === "mcp_tool_use") &&
+             typeof block.id === "string") {
+             recordDispatchedToolCall(session, block.id);
+         }
